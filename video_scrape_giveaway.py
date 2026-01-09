@@ -20,10 +20,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 # CONFIG
 # ==================================================
 OUTPUT_DIR = r"C:\Users\Jules Gregory\Desktop\video_crawler"  # full path
-MAX_VIDEOS = 5 # change to 2000 later
-SCROLL_ROUNDS = 8  # increase for better TikTok discovery
+MAX_VIDEOS = 5  # change to 2000 later
+SCROLL_ROUNDS = 5  # increase for better TikTok discovery
 DOWNLOAD_VIDEOS = True  # set True if you want videos
-MAX_VIEW_COUNT = 20000  # ignore videos with more than (ex: 20k views)
+MAX_VIEW_COUNT = 10000  # ignore videos with more than (ex: 20k views)
+
+# NEW: Duplicate tracking file
+DUPLICATE_TRACKING_FILE = os.path.join(OUTPUT_DIR, "scraped_videos_index_giveaway.json")
 
 # TikTok giveaway scam queries
 SEARCH_QUERIES = [
@@ -57,10 +60,76 @@ GIVEAWAY_SCAM_KEYWORDS = [
     "screenshot proof", "legit giveaway", "not fake", "real giveaway",
     "100% real", "no scam", "trusted", "verified giveaway",
     "working 2024", "working 2025", "working 2026", "still active", "winners announced",
-    "free stuff", "free tech", "free devices", "free electronics",
+    "free stuff", "free tech", "free devices", "free electronics", "free cards steam",
     # TikTok-specific terms
     "fyp", "viral", "trending", "duet this", "stitch this", "use this sound"
 ]
+
+# ==================================================
+# DUPLICATE PREVENTION SYSTEM
+# ==================================================
+class DuplicateTracker:
+    """Manages tracking of already-scraped videos to prevent duplicates"""
+    
+    def __init__(self, tracking_file):
+        self.tracking_file = tracking_file
+        self.scraped_videos = self._load_index()
+    
+    def _load_index(self):
+        """Load existing scraped video index from disk"""
+        if os.path.exists(self.tracking_file):
+            try:
+                with open(self.tracking_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                print(f"✓ Loaded {len(data)} previously scraped videos from index")
+                return data
+            except Exception as e:
+                print(f"⚠ Error loading index, starting fresh: {e}")
+                return {}
+        else:
+            print("✓ Starting new video index")
+            return {}
+    
+    def _save_index(self):
+        """Save scraped video index to disk"""
+        try:
+            os.makedirs(os.path.dirname(self.tracking_file), exist_ok=True)
+            with open(self.tracking_file, 'w', encoding='utf-8') as f:
+                json.dump(self.scraped_videos, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠ Error saving index: {e}")
+    
+    def is_duplicate(self, video_url, video_id=None):
+        """Check if video has already been scraped"""
+        # Check by URL (primary method)
+        if video_url in self.scraped_videos:
+            return True
+        
+        # Check by video ID (secondary method)
+        if video_id:
+            for url, data in self.scraped_videos.items():
+                if data.get('video_id') == video_id:
+                    return True
+        
+        return False
+    
+    def add_video(self, video_url, video_id, metadata=None):
+        """Add a video to the scraped index"""
+        self.scraped_videos[video_url] = {
+            'video_id': video_id,
+            'scraped_at': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'title': metadata.get('title', '') if metadata else '',
+            'uploader': metadata.get('uploader', '') if metadata else ''
+        }
+        self._save_index()
+    
+    def get_stats(self):
+        """Get statistics about scraped videos"""
+        return {
+            'total_scraped': len(self.scraped_videos),
+            'oldest': min((v['scraped_at'] for v in self.scraped_videos.values()), default=None),
+            'newest': max((v['scraped_at'] for v in self.scraped_videos.values()), default=None)
+        }
 
 # ==================================================
 # UTILS
@@ -390,6 +459,8 @@ def download_video(url, video_id):
         print(f"  ⊗ Already downloaded: {video_id}")
         return True
     
+    print(f"  Downloading video...")
+    
     # Try yt-dlp for TikTok
     ydl_opts = {
         "outtmpl": path, 
@@ -406,7 +477,7 @@ def download_video(url, video_id):
             print(f"  ⬇ Downloaded: {video_id} ({size_mb:.1f}MB)")
             return True
     except Exception as e:
-        print(f"  Error downloading: {e}")
+        print(f"  Error downloading with yt-dlp: {e}")
     
     return False
 
@@ -415,14 +486,24 @@ def download_video(url, video_id):
 # ==================================================
 def main():
     print("=" * 70)
-    print("TikTok Giveaway Scam Scraper")
+    print("TikTok Giveaway Scam Scraper (With Duplicate Prevention)")
     print(f"Max views: {MAX_VIEW_COUNT:,} | Target: {MAX_VIDEOS} videos")
+    print("=" * 70)
+    
+    # Initialize duplicate tracker
+    duplicate_tracker = DuplicateTracker(DUPLICATE_TRACKING_FILE)
+    stats = duplicate_tracker.get_stats()
+    print(f"✓ Previously scraped: {stats['total_scraped']} videos")
+    if stats['oldest']:
+        print(f"  First scraped: {stats['oldest']}")
+        print(f"  Last scraped: {stats['newest']}")
     print("=" * 70)
     
     driver = setup_driver()
     visited = set()
     collected = 0
     downloaded = 0
+    skipped_duplicates = 0
     queue = deque([tiktok_search_url(q) for q in SEARCH_QUERIES[:6]])  # Limit queries for TikTok
     
     try:
@@ -441,6 +522,14 @@ def main():
                     continue
                 
                 visited.add(video_url)
+                
+                # CHECK FOR DUPLICATES BEFORE PROCESSING
+                if duplicate_tracker.is_duplicate(video_url):
+                    skipped_duplicates += 1
+                    print(f"\n[DUPLICATE SKIPPED] {video_url}")
+                    print(f"  ⊗ Already scraped previously (Total duplicates skipped: {skipped_duplicates})")
+                    continue
+                
                 print(f"\n[{collected+1}/{MAX_VIDEOS}] Processing: {video_url}")
                 
                 # Try Selenium-based extraction first
@@ -455,16 +544,24 @@ def main():
                     print("    ⊗ Filtered out (not a giveaway scam, wrong duration, or too many views)")
                     continue
                 
+                # Additional duplicate check by video ID
+                if duplicate_tracker.is_duplicate(video_url, meta["video_id"]):
+                    skipped_duplicates += 1
+                    print(f"  ⊗ Duplicate detected by video ID (Total duplicates: {skipped_duplicates})")
+                    continue
+                
                 # Save metadata
                 if save_metadata(meta):
                     collected += 1
+                    # Add to duplicate tracker
+                    duplicate_tracker.add_video(video_url, meta["video_id"], meta)
                 
                 # Download video
                 if DOWNLOAD_VIDEOS:
                     if download_video(video_url, meta["video_id"]):
                         downloaded += 1
                 
-                print(f"    ✓ Total collected: {collected}/{MAX_VIDEOS} | Downloaded: {downloaded}")
+                print(f"    ✓ Total collected: {collected}/{MAX_VIDEOS} | Downloaded: {downloaded} | Duplicates skipped: {skipped_duplicates}")
                 
                 # Add user's profile to queue for more videos
                 if meta.get("channel") and len(queue) < 10:
@@ -477,9 +574,13 @@ def main():
                 time.sleep(random.uniform(3, 6))
         
         print("\n" + "=" * 70)
-        print(f"✓ Scraping complete! Collected {collected} giveaway scam TikToks")
-        if DOWNLOAD_VIDEOS:
-            print(f"✓ Downloaded {downloaded} videos")
+        print(f"✓ SCRAPING COMPLETE!")
+        print(f"  New videos collected: {collected}")
+        print(f"  Videos downloaded: {downloaded}")
+        print(f"  Duplicates skipped: {skipped_duplicates}")
+        
+        final_stats = duplicate_tracker.get_stats()
+        print(f"  Total unique videos in database: {final_stats['total_scraped']}")
         print("=" * 70)
         
     except KeyboardInterrupt:
@@ -488,12 +589,13 @@ def main():
         print(f"\n\n✗ Fatal error: {e}")
     finally:
         driver.quit()
-        print(f"\nFinal count: {collected} videos")
+        print(f"\nFinal count: {collected} new videos | {skipped_duplicates} duplicates skipped")
         print(f"Output directory: {os.path.abspath(OUTPUT_DIR)}")
         
         # Show output structure
         print(f"\nFiles saved:")
         print(f"  └── {OUTPUT_DIR}/")
+        print(f"      ├── scraped_videos_index_giveaway.json (duplicate tracking)")
         print(f"      ├── metadata/tiktok_giveaway/*.json")
         print(f"      └── videos/tiktok_giveaway/*.mp4")
 
